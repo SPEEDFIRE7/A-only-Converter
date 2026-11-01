@@ -1,0 +1,171 @@
+name: GSI A/B to A-only (sas-creator)
+
+# Converts a system-as-root (A/B) GSI into an A-only system image using
+# https://github.com/phhusson/sas-creator (run.sh).
+# Limits: ext4 images only (not erofs); sas-creator targets Android 11/12-era
+# GSIs built with phh patches, so newer GSIs may fail or not boot.
+
+on:
+  workflow_dispatch:
+    inputs:
+      gsi_url:
+        description: "Direct link to the A/B GSI (.img / .img.xz / .zip / .7z) or a Google Drive link"
+        required: true
+        type: string
+      arch:
+        description: "GSI architecture"
+        required: true
+        default: "64"
+        type: choice
+        options:
+          - "64"
+          - "32"
+      upload_gofile:
+        description: "Upload the result to GoFile"
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  convert:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      WORK: /mnt/work
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force || true
+          sudo mkdir -p "$WORK"
+          sudo chown -R "$USER":"$USER" "$WORK"
+          df -h / /mnt
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs android-sdk-libsparse-utils xz-utils \
+            unzip p7zip-full xattr git curl file jq python3-pip
+          pip3 install --break-system-packages gdown
+
+      - name: Download GSI
+        env:
+          URL: ${{ inputs.gsi_url }}
+        run: |
+          set -e
+          cd "$WORK"
+          mkdir -p in out
+          if echo "$URL" | grep -q "drive.google.com"; then
+            gdown --fuzzy "$URL" -O in/download
+          else
+            curl -L --fail --retry 3 -o in/download "$URL"
+          fi
+
+          BASE=$(basename "${URL%%\?*}")
+          BASE="${BASE%.xz}"; BASE="${BASE%.zip}"; BASE="${BASE%.7z}"; BASE="${BASE%.img}"
+          [ -z "$BASE" ] && BASE="gsi"
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+
+          cd in
+          T=$(file -b download)
+          echo "Detected: $T"
+          case "$T" in
+            *XZ*)
+              mv download d.xz
+              xz -d d.xz
+              mv d image
+              ;;
+            *Zip*)
+              unzip -o download -d unz
+              f=$(find unz -name '*.img' -printf '%s %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)
+              mv "$f" image
+              ;;
+            *7-zip*)
+              7z x download -ounz
+              f=$(find unz -name '*.img' -printf '%s %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)
+              mv "$f" image
+              ;;
+            *)
+              mv download image
+              ;;
+          esac
+          rm -rf unz download
+          ls -lh
+          df -h /mnt
+
+      - name: Validate image (ext4 + system-as-root)
+        run: |
+          set -e
+          cd "$WORK"
+          simg2img in/image raw.img 2>/dev/null || cp in/image raw.img
+          FS=$(file -b raw.img)
+          echo "$FS"
+          if ! echo "$FS" | grep -qi "ext[234]"; then
+            echo "::error::The image is not ext4 (erofs is not supported by sas-creator)."
+            exit 1
+          fi
+          mkdir -p chk
+          sudo mount -o loop,ro raw.img chk
+          ls chk
+          if [ ! -d chk/system ]; then
+            sudo umount chk
+            echo "::error::No /system folder at the image root: this is not a system-as-root (A/B) GSI."
+            exit 1
+          fi
+          sudo umount chk
+          rm -f raw.img
+
+      - name: Clone sas-creator
+        run: |
+          set -e
+          cd "$WORK"
+          git clone --depth 1 https://github.com/phhusson/sas-creator
+          cd sas-creator
+          git clone --depth 1 -b android-10.0 https://github.com/phhusson/vendor_vndk
+
+      - name: Convert to A-only
+        env:
+          ARCH: ${{ inputs.arch }}
+        run: |
+          set -e
+          cd "$WORK/sas-creator"
+          sudo bash run.sh "$ARCH" "$WORK/in/image"
+          ls -lh s.img
+          df -h /mnt
+
+      - name: Compress output
+        run: |
+          set -e
+          cd "$WORK"
+          xz -T0 -6 -c sas-creator/s.img > "out/${BASE}-aonly.img.xz"
+          cd out
+          sha256sum "${BASE}-aonly.img.xz" | tee "${BASE}-aonly.img.xz.sha256"
+          ls -lh
+          {
+            echo "### Result"
+            echo "- File: \`${BASE}-aonly.img.xz\`"
+            echo "- Size: $(du -h "${BASE}-aonly.img.xz" | cut -f1)"
+            echo "- sha256: \`$(cut -d' ' -f1 "${BASE}-aonly.img.xz.sha256")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload to GoFile
+        if: ${{ inputs.upload_gofile }}
+        continue-on-error: true
+        run: |
+          set -e
+          cd "$WORK/out"
+          RESP=$(curl -s -F "file=@${BASE}-aonly.img.xz" https://upload.gofile.io/uploadfile)
+          echo "$RESP"
+          LINK=$(echo "$RESP" | jq -r '.data.downloadPage')
+          echo "GoFile: $LINK"
+          echo "- GoFile: $LINK" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BASE }}-aonly
+          path: |
+            ${{ env.WORK }}/out/*.img.xz
+            ${{ env.WORK }}/out/*.sha256
+          retention-days: 3
+          compression-level: 0
