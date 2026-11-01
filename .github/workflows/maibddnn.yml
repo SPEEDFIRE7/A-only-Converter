@@ -1,0 +1,299 @@
+name: Oppo A15 Vendor Tree (blobs)
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: 'رابط الروم المباشر (نفس رابط الشجرة)'
+        required: true
+      device_repo:
+        description: 'مستودع device tree: رابط https://github.com/user/repo أو user/repo'
+        required: true
+      device_branch:
+        description: 'فرع device tree'
+        required: true
+        default: 'lineage-17.1'
+      vendor_repo:
+        description: 'مستودع vendor الهدف: رابط https://github.com/user/repo أو user/repo'
+        required: true
+      vendor_branch:
+        description: 'فرع vendor (يجب أن يختلف عن فرع device tree)'
+        required: true
+        default: 'vendor-lineage-17.1'
+      device_name:
+        description: 'اسم الجهاز (codename)'
+        required: true
+        default: 'CPH2185'
+      vendor_name:
+        description: 'اسم الشركة'
+        required: true
+        default: 'oppo'
+
+permissions:
+  contents: write
+
+jobs:
+  vendor:
+    runs-on: ubuntu-24.04
+    env:
+      TOKEN: ${{ secrets.GH_PAT || github.token }}
+      HAS_PAT: ${{ secrets.GH_PAT != '' }}
+      DEVICE: ${{ github.event.inputs.device_name }}
+      VENDOR: ${{ github.event.inputs.vendor_name }}
+    steps:
+      - name: Normalize repos and check token
+        run: |
+          norm() { T="$1"; T="${T#https://github.com/}"; T="${T#http://github.com/}"; T="${T%.git}"; T="${T%/}"; echo "$T"; }
+          D=$(norm '${{ github.event.inputs.device_repo }}')
+          V=$(norm '${{ github.event.inputs.vendor_repo }}')
+          echo "DEVICE_REPO=$D" >> "$GITHUB_ENV"
+          echo "VENDOR_REPO=$V" >> "$GITHUB_ENV"
+          # بدون GH_PAT يمكن الدفع فقط إلى مستودع الـ workflow نفسه
+          if [ "$HAS_PAT" != "true" ]; then
+            for R in "$D" "$V"; do
+              if [ "$R" != "${{ github.repository }}" ]; then
+                echo "::error::بدون GH_PAT يجب أن يكون المستودع هو ${{ github.repository }} (وجدت: $R). استعمل نفس المستودع مع فرع مختلف."
+                exit 1
+              fi
+            done
+          fi
+          # حماية: لا نستبدل فرع device tree
+          if [ "$D" = "$V" ] && [ "${{ github.event.inputs.device_branch }}" = "${{ github.event.inputs.vendor_branch }}" ]; then
+            echo "::error::فرع vendor يجب أن يختلف عن فرع device tree وإلا سيُستبدل."
+            exit 1
+          fi
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 git p7zip-full unrar aria2 \
+            android-sdk-libsparse-utils erofs-utils xxd
+
+      - name: Get proprietary-files.txt from device tree
+        run: |
+          git clone --depth 1 -b "${{ github.event.inputs.device_branch }}" \
+            "https://x-access-token:${TOKEN}@github.com/${DEVICE_REPO}.git" devtree
+          wc -l devtree/proprietary-files.txt
+
+      - name: Write super unpacker
+        run: |
+          cat > ~/lp.py <<'PY'
+          import struct, sys, os
+          src, out = sys.argv[1], sys.argv[2]
+          os.makedirs(out, exist_ok=True)
+          f = open(src, 'rb')
+          f.seek(4096)
+          if struct.unpack('<I', f.read(4))[0] != 0x616c4467:
+              sys.exit('not an LP super image')
+          f.seek(12288)
+          h = f.read(128)
+          if struct.unpack('<I', h[:4])[0] != 0x414C5030:
+              sys.exit('bad LP metadata magic')
+          header_size = struct.unpack('<I', h[8:12])[0]
+          tables_size = struct.unpack('<I', h[44:48])[0]
+          p_off, p_n, p_sz = struct.unpack('<III', h[80:92])
+          e_off, e_n, e_sz = struct.unpack('<III', h[92:104])
+          f.seek(12288 + header_size)
+          tables = f.read(tables_size)
+          WANT = ('system', 'vendor', 'product', 'oppo_product', 'odm', 'system_ext')
+          for i in range(p_n):
+              ent = tables[p_off + i * p_sz: p_off + (i + 1) * p_sz]
+              name = ent[:36].split(b'\0')[0].decode()
+              attrs, first, num, grp = struct.unpack('<IIII', ent[36:52])
+              if num == 0 or name not in WANT:
+                  continue
+              with open(os.path.join(out, name + '.img'), 'wb') as o:
+                  for j in range(first, first + num):
+                      ee = tables[e_off + j * e_sz: e_off + (j + 1) * e_sz]
+                      ns, tt, td, ts = struct.unpack('<QIQI', ee[:24])
+                      if tt != 0:
+                          continue
+                      f.seek(td * 512)
+                      rem = ns * 512
+                      while rem:
+                          c = f.read(min(rem, 1 << 24))
+                          if not c:
+                              break
+                          o.write(c)
+                          rem -= len(c)
+              print('extracted', name)
+          PY
+
+      - name: Download ROM
+        run: |
+          mkdir -p rom
+          aria2c -x16 -s16 -d rom -o rom.file "${{ github.event.inputs.rom_url }}" || \
+            aria2c -x1 -s1 -d rom -o rom.file "${{ github.event.inputs.rom_url }}"
+          cd rom
+          7z x rom.file -y -o. >/dev/null || unrar x -y rom.file >/dev/null
+          rm -f rom.file
+
+      - name: Prepare and extract partitions
+        run: |
+          mkdir -p work/parts dump mnt
+          while IFS= read -r -d '' f; do
+            b=$(basename "$f"); n="${b%.*}"
+            case "$b" in
+              super.img|super.bin) cp --update=none "$f" "work/super.img" ;;
+              system.img|vendor.img|product.img|odm.img|system_ext.img) cp --update=none "$f" "work/$b" ;;
+              system.bin|vendor.bin|product.bin|odm.bin|system_ext.bin) [ -e "work/$n.img" ] || cp "$f" "work/$n.img" ;;
+            esac
+          done < <(find rom -type f \( -name "*.img" -o -name "*.bin" \) -print0)
+
+          cd work
+          if [ -f super.img ]; then
+            if [ "$(head -c4 super.img | xxd -p)" = "3aff26ed" ]; then
+              simg2img super.img super.raw
+            else
+              mv super.img super.raw
+            fi
+            python3 ~/lp.py super.raw parts
+            rm -f super.raw
+          fi
+          for p in system vendor product odm system_ext; do
+            [ -f "$p.img" ] && [ ! -f "parts/$p.img" ] && cp "$p.img" "parts/$p.img" || true
+          done
+          cd parts
+          for img in *.img; do
+            name="${img%.img}"; name="${name%_a}"
+            raw="$img"
+            if [ "$(head -c4 "$img" | xxd -p)" = "3aff26ed" ]; then
+              simg2img "$img" "$name.raw" && raw="$name.raw"
+            fi
+            mkdir -p "../../dump/$name"
+            if fsck.erofs "$raw" >/dev/null 2>&1; then
+              fsck.erofs --extract="../../dump/$name" "$raw" || true
+            elif sudo mount -o loop,ro "$raw" ../../mnt 2>/dev/null; then
+              sudo cp -a ../../mnt/. "../../dump/$name/"
+              sudo umount ../../mnt
+              sudo chown -R "$USER" "../../dump/$name"
+            else
+              7z x -y -o"../../dump/$name" "$raw" >/dev/null || true
+            fi
+            rm -f "$name.raw" "$img"
+          done
+          cd ../..
+          ls dump
+
+      - name: Generate vendor tree
+        run: |
+          python3 - <<'PY'
+          import os, re, shutil
+
+          dev = os.environ['DEVICE']
+          vend = os.environ['VENDOR']
+          D = 'dump'
+          OUT = 'vendortree'
+          os.makedirs(OUT, exist_ok=True)
+
+          def dirs(*c):
+              return [x for x in c if os.path.isdir(x)]
+
+          BASES = {
+              'system': dirs(f'{D}/system/system', f'{D}/system'),
+              'vendor': dirs(f'{D}/vendor'),
+              'product': dirs(f'{D}/product', f'{D}/oppo_product'),
+              'odm': dirs(f'{D}/odm', f'{D}/vendor/odm'),
+              'system_ext': dirs(f'{D}/system_ext', f'{D}/system/system/system_ext'),
+          }
+          OUTVAR = {'system': 'SYSTEM', 'vendor': 'VENDOR', 'product': 'PRODUCT',
+                    'odm': 'ODM', 'system_ext': 'SYSTEM_EXT'}
+          ORDER = ['system', 'vendor', 'odm', 'product', 'system_ext']
+          print('bases:', BASES)
+
+          copy_lines = {}
+          missing = []
+          total = 0
+          for line in open('devtree/proprietary-files.txt', errors='ignore'):
+              line = line.strip()
+              if not line or line.startswith('#'):
+                  continue
+              line = line.lstrip('-')
+              src = re.split(r'[;|]', line)[0]
+              dst = None
+              if ':' in src:
+                  src, dst = src.split(':', 1)
+              total += 1
+              pref, rel = None, src
+              for p in ORDER:
+                  if src.startswith(p + '/'):
+                      pref, rel = p, src[len(p) + 1:]
+                      break
+              found = False
+              for part in ([pref] if pref else ORDER):
+                  for base in BASES[part]:
+                      f = os.path.join(base, rel)
+                      if not os.path.isfile(f):
+                          continue
+                      if os.path.getsize(f) > 90 * 1024 * 1024:
+                          continue
+                      inst = rel
+                      if dst:
+                          inst = dst[len(part) + 1:] if dst.startswith(part + '/') else dst
+                      key = (part, inst)
+                      if key in copy_lines:
+                          found = True
+                          break
+                      outp = os.path.join(OUT, 'proprietary', part, rel)
+                      os.makedirs(os.path.dirname(outp), exist_ok=True)
+                      shutil.copy2(f, outp)
+                      copy_lines[key] = (
+                          f'vendor/{vend}/{dev}/proprietary/{part}/{rel}:'
+                          f'$(TARGET_COPY_OUT_{OUTVAR[part]})/{inst}'
+                      )
+                      found = True
+                      break
+                  if found:
+                      break
+              if not found:
+                  missing.append(src)
+
+          lines = [copy_lines[k] for k in sorted(copy_lines)]
+          with open(f'{OUT}/{dev}-vendor.mk', 'w') as f:
+              f.write('# Automatically generated from the stock ROM\n\n')
+              f.write(f'PRODUCT_SOONG_NAMESPACES += vendor/{vend}/{dev}\n\n')
+              f.write('PRODUCT_COPY_FILES += \\\n    ')
+              f.write(' \\\n    '.join(lines) + '\n')
+          with open(f'{OUT}/BoardConfigVendor.mk', 'w') as f:
+              f.write('# Automatically generated from the stock ROM\n')
+          with open(f'{OUT}/Android.bp', 'w') as f:
+              f.write('soong_namespace {\n}\n')
+          with open(f'{OUT}/Android.mk', 'w') as f:
+              f.write(f'LOCAL_PATH := $(call my-dir)\n\nifeq ($(TARGET_DEVICE),{dev})\n'
+                      'include $(call all-makefiles-under,$(LOCAL_PATH))\nendif\n')
+          with open(f'{OUT}/MISSING.txt', 'w') as f:
+              f.write('\n'.join(missing) + '\n')
+
+          print(f'total={total} copied={len(lines)} missing={len(missing)}')
+          print('أول الملفات المفقودة:')
+          print('\n'.join(missing[:40]))
+          PY
+          du -sh vendortree
+          find vendortree -type f -size +90M -exec ls -lh {} \; || true
+
+      - name: Create vendor repo if missing
+        if: env.HAS_PAT == 'true'
+        env:
+          GH_TOKEN: ${{ env.TOKEN }}
+        run: |
+          if ! gh repo view "$VENDOR_REPO" >/dev/null 2>&1; then
+            gh repo create "$VENDOR_REPO" --public
+          fi
+
+      - name: Commit and push
+        run: |
+          cd vendortree
+          git init -b "${{ github.event.inputs.vendor_branch }}"
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git config http.postBuffer 524288000
+          git add -A
+          git commit -q -m "Add ${DEVICE} vendor blobs (extracted from stock ROM)"
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${VENDOR_REPO}.git"
+          git push -f origin "${{ github.event.inputs.vendor_branch }}"
+          echo "تم الرفع: https://github.com/${VENDOR_REPO}/tree/${{ github.event.inputs.vendor_branch }}"
