@@ -1,0 +1,157 @@
+name: Oppo A15 Device Tree (from scatter ROM)
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: 'رابط روم scatter (zip / 7z / rar)'
+        required: true
+
+jobs:
+  dtgen:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip python3-venv git p7zip-full unrar aria2 \
+            android-sdk-libsparse-utils erofs-utils protobuf-compiler lz4 xz-utils
+          python3 -m venv ~/venv
+          ~/venv/bin/pip install --upgrade pip
+          ~/venv/bin/pip install aospdtgen
+
+      - name: Write super unpacker
+        run: |
+          cat > ~/lp.py <<'PY'
+          import struct, sys, os
+          src, out = sys.argv[1], sys.argv[2]
+          os.makedirs(out, exist_ok=True)
+          f = open(src, 'rb')
+          f.seek(4096)
+          if struct.unpack('<I', f.read(4))[0] != 0x616c4467:
+              sys.exit('not an LP super image')
+          f.seek(12288)
+          h = f.read(128)
+          if struct.unpack('<I', h[:4])[0] != 0x414C5030:
+              sys.exit('bad LP metadata magic')
+          header_size = struct.unpack('<I', h[8:12])[0]
+          tables_size = struct.unpack('<I', h[44:48])[0]
+          p_off, p_n, p_sz = struct.unpack('<III', h[80:92])
+          e_off, e_n, e_sz = struct.unpack('<III', h[92:104])
+          f.seek(12288 + header_size)
+          tables = f.read(tables_size)
+          for i in range(p_n):
+              ent = tables[p_off + i * p_sz: p_off + (i + 1) * p_sz]
+              name = ent[:36].split(b'\0')[0].decode()
+              attrs, first, num, grp = struct.unpack('<IIII', ent[36:52])
+              if num == 0:
+                  continue
+              with open(os.path.join(out, name + '.img'), 'wb') as o:
+                  for j in range(first, first + num):
+                      ee = tables[e_off + j * e_sz: e_off + (j + 1) * e_sz]
+                      ns, tt, td, ts = struct.unpack('<QIQI', ee[:24])
+                      if tt != 0:
+                          continue
+                      f.seek(td * 512)
+                      rem = ns * 512
+                      while rem:
+                          c = f.read(min(rem, 1 << 24))
+                          if not c:
+                              break
+                          o.write(c)
+                          rem -= len(c)
+              print('extracted', name)
+          PY
+
+      - name: Download ROM
+        run: |
+          mkdir -p rom
+          aria2c -x16 -s16 -d rom -o rom.file "${{ github.event.inputs.rom_url }}" || \
+            aria2c -x1 -s1 -d rom -o rom.file "${{ github.event.inputs.rom_url }}"
+          cd rom
+          7z x rom.file -y -o. >/dev/null || unrar x -y rom.file >/dev/null
+          rm -f rom.file
+          find . -maxdepth 4 -name "*scatter*.txt"
+          find . -type f \( -name "*.img" -o -name "*.bin" \) | head -80
+
+      - name: Prepare images
+        run: |
+          mkdir -p work/parts dump
+          # نجمع كل ملفات img و bin ونوحّد الامتداد إلى .img
+          while IFS= read -r -d '' f; do
+            b=$(basename "$f"); n="${b%.*}"
+            case "$b" in
+              *.img) cp --update=none "$f" "work/$b" ;;
+              *.bin) [ -e "work/$n.img" ] || cp "$f" "work/$n.img" ;;
+            esac
+          done < <(find rom -type f \( -name "*.img" -o -name "*.bin" \) -print0)
+          ls -lh work
+
+          cd work
+          if [ -f super.img ]; then
+            if [ "$(head -c4 super.img | xxd -p)" = "3aff26ed" ]; then
+              simg2img super.img super.raw
+            else
+              mv super.img super.raw
+            fi
+            python3 ~/lp.py super.raw parts
+            rm -f super.raw
+          else
+            echo "لا يوجد super، نبحث عن أقسام منفصلة"
+          fi
+          for p in system vendor product odm system_ext; do
+            [ -f "$p.img" ] && [ ! -f "parts/$p.img" ] && cp "$p.img" "parts/$p.img" || true
+          done
+          ls -lh parts
+
+      - name: Extract partitions
+        run: |
+          mkdir -p mnt
+          cd work/parts
+          for img in *.img; do
+            case "$img" in *_b.img) continue ;; esac
+            name="${img%.img}"; name="${name%_a}"
+            raw="$img"
+            if [ "$(head -c4 "$img" | xxd -p)" = "3aff26ed" ]; then
+              simg2img "$img" "$name.raw" && raw="$name.raw"
+            fi
+            mkdir -p "../../dump/$name"
+            if fsck.erofs "$raw" >/dev/null 2>&1; then
+              fsck.erofs --extract="../../dump/$name" "$raw" || true
+            elif sudo mount -o loop,ro "$raw" ../../mnt 2>/dev/null; then
+              sudo cp -a ../../mnt/. "../../dump/$name/"
+              sudo umount ../../mnt
+              sudo chown -R "$USER" "../../dump/$name"
+            else
+              7z x -y -o"../../dump/$name" "$raw" >/dev/null || true
+            fi
+            rm -f "$name.raw"
+          done
+          cd ../..
+          # صور البوت في جذر الـ dump
+          for f in boot recovery dtbo vbmeta; do
+            [ -f "work/$f.img" ] && cp "work/$f.img" dump/ || true
+          done
+          ls dump
+          find dump -maxdepth 3 -name "build.prop" | head
+
+      - name: Run aospdtgen
+        run: |
+          ~/venv/bin/python -m aospdtgen dump -o output
+          ls -R output | head -80
+
+      - name: Package result
+        run: |
+          cd output
+          zip -r ../oppo-a15-device-tree.zip .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oppo-a15-device-tree
+          path: oppo-a15-device-tree.zip
