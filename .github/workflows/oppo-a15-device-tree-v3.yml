@@ -1,0 +1,249 @@
+name: Oppo A15 Device Tree (from scatter ROM)
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: 'رابط روم scatter (zip / 7z / rar)'
+        required: true
+      variant:
+        description: 'موديل الجهاز (A15 = CPH2185 ، A15s = CPH2179)'
+        required: true
+        default: 'CPH2185'
+
+jobs:
+  dtgen:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip python3-venv git p7zip-full unrar aria2 \
+            android-sdk-libsparse-utils erofs-utils protobuf-compiler lz4 xz-utils
+          python3 -m venv ~/venv
+          ~/venv/bin/pip install --upgrade pip
+          ~/venv/bin/pip install aospdtgen
+
+      - name: Write super unpacker
+        run: |
+          cat > ~/lp.py <<'PY'
+          import struct, sys, os
+          src, out = sys.argv[1], sys.argv[2]
+          os.makedirs(out, exist_ok=True)
+          f = open(src, 'rb')
+          f.seek(4096)
+          if struct.unpack('<I', f.read(4))[0] != 0x616c4467:
+              sys.exit('not an LP super image')
+          f.seek(12288)
+          h = f.read(128)
+          if struct.unpack('<I', h[:4])[0] != 0x414C5030:
+              sys.exit('bad LP metadata magic')
+          header_size = struct.unpack('<I', h[8:12])[0]
+          tables_size = struct.unpack('<I', h[44:48])[0]
+          p_off, p_n, p_sz = struct.unpack('<III', h[80:92])
+          e_off, e_n, e_sz = struct.unpack('<III', h[92:104])
+          f.seek(12288 + header_size)
+          tables = f.read(tables_size)
+          for i in range(p_n):
+              ent = tables[p_off + i * p_sz: p_off + (i + 1) * p_sz]
+              name = ent[:36].split(b'\0')[0].decode()
+              attrs, first, num, grp = struct.unpack('<IIII', ent[36:52])
+              if num == 0:
+                  continue
+              with open(os.path.join(out, name + '.img'), 'wb') as o:
+                  for j in range(first, first + num):
+                      ee = tables[e_off + j * e_sz: e_off + (j + 1) * e_sz]
+                      ns, tt, td, ts = struct.unpack('<QIQI', ee[:24])
+                      if tt != 0:
+                          continue
+                      f.seek(td * 512)
+                      rem = ns * 512
+                      while rem:
+                          c = f.read(min(rem, 1 << 24))
+                          if not c:
+                              break
+                          o.write(c)
+                          rem -= len(c)
+              print('extracted', name)
+          PY
+
+      - name: Download ROM
+        run: |
+          mkdir -p rom
+          aria2c -x16 -s16 -d rom -o rom.file "${{ github.event.inputs.rom_url }}" || \
+            aria2c -x1 -s1 -d rom -o rom.file "${{ github.event.inputs.rom_url }}"
+          cd rom
+          7z x rom.file -y -o. >/dev/null || unrar x -y rom.file >/dev/null
+          rm -f rom.file
+          find . -maxdepth 4 -name "*scatter*.txt"
+
+      - name: Prepare images
+        run: |
+          mkdir -p work/parts dump
+          while IFS= read -r -d '' f; do
+            b=$(basename "$f"); n="${b%.*}"
+            case "$b" in
+              *.img) cp --update=none "$f" "work/$b" ;;
+              *.bin) [ -e "work/$n.img" ] || cp "$f" "work/$n.img" ;;
+            esac
+          done < <(find rom -type f \( -name "*.img" -o -name "*.bin" \) -print0)
+
+          cd work
+          if [ -f super.img ]; then
+            if [ "$(head -c4 super.img | xxd -p)" = "3aff26ed" ]; then
+              simg2img super.img super.raw
+            else
+              mv super.img super.raw
+            fi
+            python3 ~/lp.py super.raw parts
+            rm -f super.raw
+          fi
+          for p in system vendor product odm system_ext; do
+            [ -f "$p.img" ] && [ ! -f "parts/$p.img" ] && cp "$p.img" "parts/$p.img" || true
+          done
+          ls -lh parts
+
+      - name: Extract partitions
+        run: |
+          mkdir -p mnt
+          cd work/parts
+          for img in *.img; do
+            case "$img" in *_b.img) continue ;; esac
+            name="${img%.img}"; name="${name%_a}"
+            raw="$img"
+            if [ "$(head -c4 "$img" | xxd -p)" = "3aff26ed" ]; then
+              simg2img "$img" "$name.raw" && raw="$name.raw"
+            fi
+            mkdir -p "../../dump/$name"
+            if fsck.erofs "$raw" >/dev/null 2>&1; then
+              fsck.erofs --extract="../../dump/$name" "$raw" || true
+            elif sudo mount -o loop,ro "$raw" ../../mnt 2>/dev/null; then
+              sudo cp -a ../../mnt/. "../../dump/$name/"
+              sudo umount ../../mnt
+              sudo chown -R "$USER" "../../dump/$name"
+            else
+              7z x -y -o"../../dump/$name" "$raw" >/dev/null || true
+            fi
+            rm -f "$name.raw"
+          done
+          cd ../..
+          for f in boot recovery dtbo vbmeta; do
+            [ -f "work/$f.img" ] && cp "work/$f.img" dump/ || true
+          done
+          ls dump
+
+      - name: Pick variant props (A15 / A15s)
+        env:
+          VARIANT: ${{ github.event.inputs.variant }}
+        run: |
+          echo "== ro.product في كل build.prop =="
+          grep -H "^ro.product" dump/*/build.prop dump/system/system/build.prop 2>/dev/null | head -80 || true
+          echo "== أي partition version يحتوي الموديل =="
+          grep -l "CPH2185" dump/version.*/build.prop 2>/dev/null || true
+          echo "-- A15s --"
+          grep -l "CPH2179" dump/version.*/build.prop 2>/dev/null || true
+
+          python3 - <<'PY'
+          import os, glob
+          variant = os.environ['VARIANT']
+
+          def parse(p):
+              d = {}
+              for line in open(p, errors='ignore').read().splitlines():
+                  line = line.strip()
+                  if '=' in line and not line.startswith('#'):
+                      k, v = line.split('=', 1)
+                      d[k.strip()] = v.strip()
+              return d
+
+          vers = sorted(glob.glob('dump/version.*/build.prop'))
+          sel = None
+          for p in vers:
+              if variant in open(p, errors='ignore').read():
+                  sel = p
+                  break
+          print('versions found:', len(vers))
+          print('selected:', sel)
+
+          props = parse(sel) if sel else {}
+          # إن لم نجد props في partition الـ version نجمع من كل build.prop
+          if not any(k.startswith('ro.product.') for k in props):
+              for p in glob.glob('dump/**/build.prop', recursive=True):
+                  if '/version.' in p:
+                      continue
+                  for k, v in parse(p).items():
+                      props.setdefault(k, v)
+
+          def pick(field):
+              for part in ('system', '', 'odm', 'vendor', 'product', 'system_ext'):
+                  k = f'ro.product.{part}.{field}' if part else f'ro.product.{field}'
+                  if props.get(k):
+                      return props[k]
+              for k, v in props.items():
+                  if k.startswith('ro.product.') and k.endswith('.' + field) and v:
+                      return v
+              return None
+
+          fallback = {'device': variant, 'name': variant, 'model': variant,
+                      'brand': 'OPPO', 'manufacturer': 'OPPO'}
+          derived = {}
+          for field in ('device', 'name', 'brand', 'model', 'manufacturer', 'marketname'):
+              v = pick(field) or fallback.get(field)
+              if not v:
+                  continue
+              derived[f'ro.product.{field}'] = v
+              for part in ('system', 'vendor', 'odm', 'product', 'system_ext'):
+                  derived[f'ro.product.{part}.{field}'] = v
+
+          target = None
+          for c in ('dump/system/system/build.prop', 'dump/system/build.prop'):
+              if os.path.exists(c):
+                  target = c
+                  break
+          print('target build.prop:', target)
+          existing = parse(target)
+          lines = ['', '# --- injected from version partition (%s) ---' % variant]
+          for k, v in list(props.items()) + list(derived.items()):
+              if k not in existing:
+                  existing[k] = v
+                  lines.append(f'{k}={v}')
+          with open(target, 'a') as f:
+              f.write('\n'.join(lines) + '\n')
+
+          vend = 'dump/vendor/build.prop'
+          if os.path.exists(vend):
+              vex = parse(vend)
+              with open(vend, 'a') as f:
+                  for k, v in derived.items():
+                      if k not in vex:
+                          f.write(f'{k}={v}\n')
+
+          print('device =', derived.get('ro.product.device'))
+          print('model  =', derived.get('ro.product.model'))
+          PY
+
+          # نبعد partitions الـ version حتى لا تتداخل مع aospdtgen
+          mkdir -p versions
+          mv dump/version.* versions/ 2>/dev/null || true
+          grep -h "^ro.product.system.device\|^ro.product.device" dump/system/system/build.prop || true
+
+      - name: Run aospdtgen
+        run: |
+          ~/venv/bin/python -m aospdtgen dump -o output
+          ls -R output | head -80
+
+      - name: Package result
+        run: |
+          cd output
+          zip -r ../oppo-a15-device-tree.zip .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oppo-a15-device-tree
+          path: oppo-a15-device-tree.zip
