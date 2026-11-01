@@ -1,0 +1,98 @@
+name: Oppo A15 Device Tree (from scatter ROM)
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: 'رابط روم scatter (zip / 7z / rar)'
+        required: true
+
+jobs:
+  dtgen:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip python3-venv git p7zip-full unrar aria2 \
+            android-sdk-libsparse-utils erofs-utils protobuf-compiler lz4 xz-utils
+          python3 -m venv ~/venv
+          ~/venv/bin/pip install --upgrade pip
+          ~/venv/bin/pip install aospdtgen
+          git clone --depth=1 https://github.com/unix3dgforce/lpunpack ~/lpunpack
+          ~/venv/bin/pip install -r ~/lpunpack/requirements.txt 2>/dev/null || true
+
+      - name: Download ROM
+        run: |
+          mkdir -p rom
+          aria2c -x16 -s16 -d rom -o rom.file "${{ github.event.inputs.rom_url }}"
+          cd rom
+          7z x rom.file -y -o. >/dev/null || unrar x -y rom.file >/dev/null
+          rm -f rom.file
+          find . -maxdepth 3 -name "*scatter*.txt"
+          find . -maxdepth 3 -name "*.img*" | head -50
+
+      - name: Prepare images
+        run: |
+          mkdir -p work dump
+          # ننقل كل الصور إلى مجلد واحد
+          find rom -type f \( -name "*.img" -o -name "*.img.*" -o -name "*.bin" \) -exec cp -n {} work/ \;
+          cd work
+          # دمج وفك sparse لـ super
+          SUPER=$(ls super*.img* 2>/dev/null | sort || true)
+          if [ -n "$SUPER" ]; then
+            if [ "$(echo "$SUPER" | wc -l)" -gt 1 ]; then
+              simg2img $SUPER super.raw
+            else
+              simg2img $SUPER super.raw 2>/dev/null || cp $SUPER super.raw
+            fi
+            python3 ~/lpunpack/lpunpack.py super.raw parts || ~/venv/bin/python ~/lpunpack/lpunpack.py super.raw parts
+            ls -lh parts
+          fi
+          # صور أخرى (system/vendor منفصلة إن لم يوجد super)
+          for p in system vendor product odm; do
+            [ -f "$p.img" ] && mkdir -p parts && cp -n "$p.img" "parts/${p}.img" || true
+          done
+
+      - name: Extract partitions
+        run: |
+          cd work/parts
+          for img in *.img; do
+            name="${img%%_a.img}"; name="${name%.img}"
+            raw="$img"
+            file "$img" | grep -qi sparse && { simg2img "$img" "$name.raw" && raw="$name.raw"; }
+            mkdir -p "../../dump/$name"
+            if file "$raw" | grep -qi erofs || fsck.erofs "$raw" >/dev/null 2>&1; then
+              fsck.erofs --extract="../../dump/$name" "$raw" || true
+            else
+              7z x -y -o"../../dump/$name" "$raw" >/dev/null || true
+            fi
+          done
+          cd ../..
+          # صور البوت وغيرها في جذر الـ dump
+          for f in boot recovery dtbo vbmeta; do
+            [ -f "work/$f.img" ] && cp "work/$f.img" dump/ || true
+          done
+          ls dump
+
+      - name: Run aospdtgen
+        run: |
+          ~/venv/bin/python -m aospdtgen dump -o output
+          ls -R output | head -80
+
+      - name: Package result
+        run: |
+          cd output
+          zip -r ../oppo-a15-device-tree.zip .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oppo-a15-device-tree
+          path: oppo-a15-device-tree.zip
+          
